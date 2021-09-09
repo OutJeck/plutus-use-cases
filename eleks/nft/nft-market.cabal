@@ -92,6 +92,7 @@ executable nft-market-pab
     base >= 4.9 && < 5,
     bytestring,
     base64-bytestring,
+    data-default -any,
     text -any,
     containers -any,
     lens -any,

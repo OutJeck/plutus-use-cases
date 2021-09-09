@@ -18,6 +18,7 @@ import qualified Control.Concurrent.STM              as STM
 import           Control.Monad.Freer.Error           (Error)
 import           Control.Monad.Freer.Extras.Log      (LogMsg)
 import           Control.Monad.IO.Class              (MonadIO (..))
+import           Data.Default                        (Default (def))
 import qualified Data.Monoid                         as Monoid
 import qualified Data.Map.Strict                     as Map
 import           Data.Text                           (Text, pack)
@@ -112,7 +113,7 @@ handleNFTMarketContract = Builtin.handleBuiltin getSchema getContract where
 
 handlers :: SimulatorEffectHandlers (Builtin NFTMarketContracts)
 handlers =
-    Simulator.mkSimulatorHandlers @(Builtin NFTMarketContracts)[] --[NFTStartContract, NFTUserContract]
+    Simulator.mkSimulatorHandlers @(Builtin NFTMarketContracts) def [] --[NFTStartContract, NFTUserContract]
     $ interpret handleNFTMarketContract
 
 wallets :: [Wallet]
