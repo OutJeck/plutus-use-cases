@@ -62,7 +62,9 @@ checkRequesTokenPolicy :: OracleRequestToken -> OracleRequestRedeemer -> ScriptC
 checkRequesTokenPolicy requestToken r ctx@ScriptContext{scriptContextTxInfo=TxInfo{txInfoInputs}, scriptContextPurpose=Minting _} = 
     case r of
         Request     -> traceIfFalse "Should forge one token" (forgedCount == 1)
-                    && traceIfFalse "Is fee and collateral paid" (isFeeAndCollateralPaid (Just $ ortOperator requestToken))
+                    -- todo: https://github.com/input-output-hk/plutus-apps/issues/161
+                    -- && traceIfFalse "Is forged with collateral" (isForgedWithCollateral)
+                    -- && traceIfFalse "Is fee paid" (isFeePaid (Just $ ortOperator requestToken))
         RedeemToken -> traceIfFalse "Should redeem one token" (forgedCount == -1)
     where
         ownSymbol = ownCurrencySymbol ctx
@@ -72,10 +74,15 @@ checkRequesTokenPolicy requestToken r ctx@ScriptContext{scriptContextTxInfo=TxIn
         forgedCount = valueOf forged ownSymbol oracleRequestTokenName
         feeValue = Ada.toValue $ ortFee requestToken
         collateralValue = Ada.toValue $ ortCollateral requestToken
-        isFeeAndCollateralPaid :: Maybe PubKeyHash -> Bool
-        isFeeAndCollateralPaid operatorAddr = isJust . find (\o ->
-            txOutValue o == (feeValue <> collateralValue)  &&
+        isFeePaid :: Maybe PubKeyHash -> Bool
+        isFeePaid operatorAddr = isJust . find (\o ->
+            txOutValue o == feeValue  &&
             operatorAddr == Validation.pubKeyOutput o) $ txInfoOutputs info
+        isForgedWithCollateral :: Bool
+        isForgedWithCollateral = isJust . find (\o -> 
+            txOutValue o == Value.singleton ownSymbol oracleRequestTokenName 1 
+                            <> (Ada.toValue $ ortCollateral requestToken)
+            ) $ txInfoOutputs info
 
 requestTokenPolicy :: OracleRequestToken -> LedgerScripts.MintingPolicy
 requestTokenPolicy oracle = LedgerScripts.mkMintingPolicyScript $

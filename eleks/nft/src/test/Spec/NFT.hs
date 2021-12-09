@@ -7,6 +7,7 @@
 {-# LANGUAGE OverloadedStrings  #-}
 {-# LANGUAGE LambdaCase         #-}
 {-# LANGUAGE MonoLocalBinds     #-}
+{-# LANGUAGE NumericUnderscores #-}
 
 module Spec.NFT
     ( tests
@@ -56,20 +57,16 @@ userContract = NFTMarket.userEndpoints nftMarketMock
 tests :: TestTree
 tests = testGroup "nft"
     [
-        -- checkPredicate "Owner contract expose 'start' endpoints"
-        -- (
-        --     endpointAvailable @"start" ownerContract t1
-        -- )
-        -- activeOwnerContractTrace
-        -- ,
         checkPredicate "Should create NFT token"
         ( 
             assertNoFailedTransactions
             .&&. valueAtAddress (marketAddress nftMarketMock) 
                 (== (assetClassValue (testTokenMetaClass testToken1) 1 
                     <> assetClassValue (marketId nftMarketMock) 1)
+                    <> minUtxoValN 2
                 )
-            .&&. walletFundsChange w1 (assetClassValue (testTokenClass testToken1) 1)
+            .&&. walletFundsChange w1 (assetClassValue (testTokenClass testToken1) 1 <> inv minUtxoVal)
+            .&&. walletFundsChange ownerWallet (inv minUtxoVal)
             .&&. assertAccumState userContract t1 
                 (\case Last (Just (Right (NFTMarket.Created meta))) -> meta == testToken1MetaDto; _ -> False) 
                 "should create NFT state"
@@ -88,9 +85,11 @@ tests = testGroup "nft"
             .&&. valueAtAddress (marketAddress nftMarketMock)
                 (== (assetClassValue (testTokenClass testToken1) 1 
                     <> assetClassValue (testTokenMetaClass testToken1)  1 
-                    <> assetClassValue (marketId nftMarketMock) 1))
+                    <> assetClassValue (marketId nftMarketMock) 1
+                    <> minUtxoValN 2)
+                )
             -- create and send token in one trace
-            .&&. walletFundsChange w1 (Ada.lovelaceValueOf 0)
+            .&&. walletFundsChange w1 (inv minUtxoVal)
             .&&. assertAccumState userContract t1
             (\case Last (Just (Right (NFTMarket.Selling meta))) -> 
                         meta == (toMetaDto $ makeSellingTestToken testToken1 w1 nftMaketSellPrice);
@@ -121,14 +120,23 @@ tests = testGroup "nft"
         )
         sellFailureOnLessThanZeroPriceTrace
         ,
+        checkPredicate "Should fail start selling if price less than fee"
+        ( 
+            assertFailedTransaction (\_ err _ -> case err of {ScriptFailure (EvaluationError ["price should be greater than fee", "PT5"] _) -> True; _ -> False  })
+        )
+        sellFailureOnLessThanFeePriceTrace
+        ,
         checkPredicate "Should cancel NFT token selling"
         ( 
             assertNoFailedTransactions
             .&&. valueAtAddress (marketAddress nftMarketMock)
                 (== (assetClassValue (testTokenMetaClass testToken1) 1 
-                    <> assetClassValue (marketId nftMarketMock) 1))
+                    <> assetClassValue (marketId nftMarketMock) 1
+                    <> minUtxoValN 2
+                    )
+                )
             -- create and send token in one trace
-            .&&. walletFundsChange w1 (assetClassValue (testTokenClass testToken1) 1)
+            .&&. walletFundsChange w1 (assetClassValue (testTokenClass testToken1) 1 <> (inv minUtxoVal))
             .&&. assertAccumState userContract t1
             (\case Last (Just (Right (NFTMarket.CancelSelling meta))) -> 
                          meta == testToken1MetaDto;
@@ -157,15 +165,18 @@ tests = testGroup "nft"
         checkPredicate "Should buy NFT token"
         ( 
            assertNoFailedTransactions
-           .&&. valueAtAddress (marketAddress nftMarketMock) 
+            .&&. valueAtAddress (marketAddress nftMarketMock) 
                 (== (assetClassValue (testTokenMetaClass testToken1) 1 
-                    <> assetClassValue (marketId nftMarketMock) 1))
-           .&&. walletFundsChange w1 (Ada.lovelaceValueOf (nftMaketSellPrice - nftMarketFee))
-           .&&. walletFundsChange w2 (Ada.lovelaceValueOf (negate (nftMaketSellPrice)) <> assetClassValue (testTokenClass testToken1) 1)
-           .&&. walletFundsChange ownerWallet (Ada.lovelaceValueOf nftMarketFee)
-           .&&. assertAccumState userContract t2
-                (\case Last (Just (Right (NFTMarket.Buyed meta))) -> meta == testToken1MetaDto; _ -> False) 
-                "should create buy NFT state"
+                    <> assetClassValue (marketId nftMarketMock) 1
+                    <> minUtxoValN 2
+                    )
+                )
+            .&&. walletFundsChange w1 (Ada.lovelaceValueOf (nftMaketSellPrice - nftMarketFee) <> (inv minUtxoVal))
+            .&&. walletFundsChange w2 (Ada.lovelaceValueOf (negate (nftMaketSellPrice)) <> assetClassValue (testTokenClass testToken1) 1)
+            .&&. walletFundsChange ownerWallet (Ada.lovelaceValueOf nftMarketFee <> (inv marketUtxoVal))
+            .&&. assertAccumState userContract t2
+                 (\case Last (Just (Right (NFTMarket.Buyed meta))) -> meta == testToken1MetaDto; _ -> False) 
+                 "should create buy NFT state"
         )
         buyNftTokenFlowTrace
         ,
@@ -231,7 +242,7 @@ tests = testGroup "nft"
             assertNoFailedTransactions
             .&&. assertAccumState userContract t1
             (\case Last (Just (Right (NFTMarket.UserPubKeyHash keyHash))) -> 
-                        keyHash Prelude.== (B.unpack . B64.encode . fromBuiltin . getPubKeyHash . pubKeyHash . walletPubKey $ w1); 
+                        keyHash Prelude.== (B.unpack . B64.encode . fromBuiltin . getPubKeyHash . walletPubKeyHash $ w1); 
                    _ -> False) 
                 "should get wallet key state"
         )
@@ -280,6 +291,13 @@ sellFailureOnLessThanZeroPriceTrace = do
     user1Hdl <- Trace.activateContractWallet w1 userContract
     nftTokenMeta <- createNftTokenTrace user1Hdl testToken1
     sellNftTokenTrace user1Hdl nftTokenMeta 0
+
+sellFailureOnLessThanFeePriceTrace  :: EmulatorTrace ()
+sellFailureOnLessThanFeePriceTrace = do
+    initialise
+    user1Hdl <- Trace.activateContractWallet w1 userContract
+    nftTokenMeta <- createNftTokenTrace user1Hdl testToken1
+    sellNftTokenTrace user1Hdl nftTokenMeta sellPriceLowerThanFee
 
 cancelSellNftTokenFlowTrace :: EmulatorTrace ()
 cancelSellNftTokenFlowTrace = do
@@ -390,7 +408,7 @@ createNftTokenTrace ::
     -> EmulatorTrace NFTMetadataDto
 createNftTokenTrace hdl testToken = do
     let nftTokenParams = NFTMarket.CreateParams { 
-        cpTokenName = read . show $ testTokenName testToken
+        cpTokenName = read . show $ testDisplayTokenName testToken
         , cpDescription = testTokenDesciption testToken
         , cpAuthor = testTokenAuthor testToken
         , cpFile = testTokenFile testToken }

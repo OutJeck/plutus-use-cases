@@ -22,7 +22,7 @@ module Contracts.MutualBet.OffChain(
     MutualBetStartSchema,
     BettorSchema,
     MutualBetParams(..),
-    NewBetParams(..),
+    BetParams(..),
     mutualBetStart,
     mutualBetBettor,
     MutualBetOutput(..),
@@ -52,7 +52,7 @@ import qualified Ledger.Constraints               as Constraints
 import           Ledger.Constraints               (ScriptLookups (..))
 import           Ledger.Constraints.TxConstraints (TxConstraints)
 import qualified Ledger.Interval                  as Interval
-import qualified Ledger.Oracle                    as Oracle
+import qualified Plutus.Contract.Oracle           as Oracle
 import           Ledger.TimeSlot                  (SlotConfig)
 import qualified Ledger.TimeSlot                  as TimeSlot
 import qualified Ledger.Typed.Scripts             as Scripts
@@ -69,15 +69,16 @@ import           PlutusTx.Prelude
 import qualified Prelude                          as Haskell
 import           Types.Game
 
-data NewBetParams = 
-    NewBetParams
+data BetParams = 
+    BetParams
         { nbpAmount  :: Integer -- Bet lovelace amount 
         , nbpWinnerId :: Integer -- Bet on this team to win
         }
     deriving stock (Haskell.Eq, Haskell.Show, Generic)
     deriving anyclass (ToJSON, FromJSON, ToSchema)
 
-type BettorSchema = Endpoint "bet" NewBetParams
+type BettorSchema = Endpoint "bet" BetParams
+                    .\/ Endpoint "cancelBet" BetParams
 type MutualBetStartSchema = EmptySchema -- Don't need any endpoints: the contract runs automatically until the mutual bet is finished.
 
 data MutualBetError =
@@ -111,9 +112,9 @@ machineClient inst threadToken mutualBetParams =
 mutualBetStart :: MutualBetParams -> Contract MutualBetOutput MutualBetStartSchema MutualBetError ()
 mutualBetStart params = do
     threadToken <- SM.getThreadToken
-    --logInfo "bet start thread token" ++ Haskell.show threadToken
+    logInfo ("bet start thread token" ++ Haskell.show threadToken)
     tell $ threadTokenOut threadToken
-    self <- Ledger.pubKeyHash <$> ownPubKey
+    self <- ownPubKeyHash
     let inst         = typedValidator (threadToken, params)
         client       = machineClient inst threadToken params
 
@@ -156,7 +157,7 @@ payout params client GameStateChange{gmsOutRef, gmsOutTx, gmsOracleData, gmsSign
                 , slOtherScripts = Map.singleton (oracleValidatorHash oracle) (oracleValidator oracle)
                 , slOtherData = Map.empty
                 , slTypedValidator = Nothing
-                , slOwnPubkey = Nothing
+                , slOwnPubkeyHash = Nothing
                 }
         constraints = Constraints.mustSpendScriptOutput gmsOutRef redeemer
                     <> Constraints.mustMintValueWithRedeemer mintRedeemer (inv requestToken)
@@ -197,7 +198,7 @@ cancelGame params client  GameStateChange{gmsOutRef, gmsOutTx}  = do
                 , slOtherScripts = Map.singleton (oracleValidatorHash oracle) (oracleValidator oracle)
                 , slOtherData = Map.empty
                 , slTypedValidator = Nothing
-                , slOwnPubkey = Nothing
+                , slOwnPubkeyHash = Nothing
                 }
         constraints = Constraints.mustSpendScriptOutput gmsOutRef redeemer
                     <> Constraints.mustMintValueWithRedeemer mintRedeemer (inv requestToken)
@@ -236,9 +237,9 @@ Updates to the user are provided via 'tell'.
 
 -}
 
-isCurrentGame :: Ledger.PubKey -> MutualBetParams -> OracleData -> Either Haskell.String OracleData
-isCurrentGame pk params oracleData
-    | (pubKeyHash pk) /= (ovRequestAddress oracleData) = Left "Not signed by owner wallet"
+isCurrentGame :: Ledger.PubKeyHash -> MutualBetParams -> OracleData -> Either Haskell.String OracleData
+isCurrentGame pkh params oracleData
+    | pkh /= (ovRequestAddress oracleData) = Left "Not signed by owner wallet"
     | (mbpGame params) /= (ovGame oracleData) = Left "Not current game"
     | otherwise = Right oracleData
 
@@ -261,23 +262,25 @@ waitForGameStateChange ::
 waitForGameStateChange params = do
         waitEnd
     where
-        isCurrentGameState pk params GameStateChange{gmsOracleData} = isRight $ isCurrentGame pk params gmsOracleData
+        isCurrentGameState pkh params GameStateChange{gmsOracleData} = isRight $ isCurrentGame pkh params gmsOracleData
         waitEnd = do  
             txs <- mapError OracleError $ awaitNextOracleRequest (mbpOracle params)
-            pk <- ownPubKey
+            pkh <- ownPubKeyHash
             logInfo @Haskell.String "Await next"
-            let currentGameSignedTx = find (isCurrentGameState pk params) . catMaybes . map (mapSignedMessage params) $ txs 
+            let currentGameSignedTx = find (isCurrentGameState pkh params) . catMaybes . map (mapSignedMessage params) $ txs 
             case currentGameSignedTx of
                 Nothing -> do { logInfo @Haskell.String "Not current game state change"; waitEnd; }
                 Just d  -> do { logInfo ("State changes " ++ Haskell.show d); return d; }
 
 data BettorEvent =
-        MutualBetIsOver [Bet] -- ^ The mutual bet is over
-        | MakeBet NewBetParams -- ^ make a bet bet
+        MutualBetIsOver [Bet] TeamId -- ^ The mutual bet is over
+        | MakeBet BetParams -- ^ make a bet bet
+        | UndoBet BetParams -- ^ cancel a bet
         | BettingHasСlosed [Bet] -- ^ no one can place more bets
         | OtherBet [Bet] -- ^ Another bettor make a bet
         | NoChange [Bet] -- ^ Nothing has changed
         deriving (Haskell.Show)
+
 waitForChange :: SlotConfig -> MutualBetParams -> StateMachineClient MutualBetState MutualBetInput -> [Bet] -> Contract MutualBetOutput BettorSchema MutualBetError BettorEvent
 waitForChange slotCfg params client bets = do
     now <- currentTime
@@ -287,6 +290,9 @@ waitForChange slotCfg params client bets = do
         makeBet = endpoint @"bet" $ \params -> do 
                                         logInfo ("last bets" ++ Haskell.show params)
                                         pure $ MakeBet params
+        cancelBet = endpoint @"cancelBet" $ \params -> do 
+                                logInfo ("last bets" ++ Haskell.show params)
+                                pure $ UndoBet params
         otherBid = do
             promiseBind
                 smUpdatePromise
@@ -295,10 +301,11 @@ waitForChange slotCfg params client bets = do
                         do 
                             case input of 
                                 Payout{oracleSigned=signedMessage} -> do
-                                    logInfo ("signedMessage " ++ Haskell.show signedMessage)
-                                    pure (MutualBetIsOver bets)
-                                CancelGame -> pure (MutualBetIsOver bets)
-                                _          -> pure (MutualBetIsOver bets)
+                                    let winnerId = getWinnerId signedMessage
+                                    logInfo ("Winner ID: " ++ Haskell.show winnerId)
+                                    pure (MutualBetIsOver bets winnerId)
+                                CancelGame -> pure (MutualBetIsOver bets 0)
+                                _          -> pure (MutualBetIsOver bets 0)
                     -- The state machine transitionned to a new state
                     Transition _ _ SM.OnChainState{SM.ocsTxOut=TypedScriptTxOut{tyTxOutData=state}}   -> do
                         case state of 
@@ -308,7 +315,13 @@ waitForChange slotCfg params client bets = do
                                 logInfo @Haskell.String ("Unexpected state")
                                 pure (NoChange bets)
                     _ -> pure (NoChange bets)
-    selectList [makeBet, otherBid]
+    selectList [makeBet, cancelBet, otherBid]
+
+getWinnerId :: (Oracle.SignedMessage OracleSignedMessage) -> TeamId
+getWinnerId signedMessage = 
+    case PlutusTx.fromBuiltinData . getDatum $ Oracle.osmDatum signedMessage of
+        Just oracleMessage -> osmWinnerId oracleMessage
+        Nothing -> 0    
 
 handleEvent :: StateMachineClient MutualBetState MutualBetInput -> [Bet] -> BettorEvent -> Contract MutualBetOutput BettorSchema MutualBetError (Either [Bet] ())
 handleEvent client bets change =
@@ -316,27 +329,42 @@ handleEvent client bets change =
         stop     = pure (Right ())
     -- see note [Bettor client]
     in case change of
-        MutualBetIsOver s -> do
-            logInfo ("Mutual bet over"  ++ Haskell.show bets)
-            tell (mutualBetStateOut $ Finished s)
+        MutualBetIsOver s w -> do
+            let bets' = includeWinshareInBets w bets
+            logInfo ("Mutual bet over"  ++ Haskell.show bets')
+            tell (mutualBetStateOut $ Finished bets')
             stop
         BettingHasСlosed s -> do
             logInfo @Haskell.String "Betting has closed"  
+            logInfo ("BettingHasСlosedState: "  ++ Haskell.show s)
             tell (mutualBetStateOut $ BettingClosed s)
             continue s
         MakeBet betParams -> do
-            logInfo @Haskell.String "Submitting bid"
-            self <- Ledger.pubKeyHash <$> ownPubKey
-            logInfo @Haskell.String "Received pubkey"
+            logInfo @Haskell.String "Submitting bet"
+            self <- ownPubKeyHash
             let betAda = Ada.lovelaceOf $ nbpAmount betParams
-                newBet = NewBet{newBetAmount = betAda, newBettor = self, newBetTeamId = nbpWinnerId betParams}
-            r <- SM.runStep client newBet
+                newBetInput = NewBet{ newBet = Bet{ betAmount = betAda, betBettor = self, betTeamId = nbpWinnerId betParams, betWinShare = Ada.lovelaceOf 0}}
+            r <- SM.runStep client newBetInput
             logInfo @Haskell.String "SM: runStep done"
             case r of
                 SM.TransitionFailure i -> logError (TransitionFailed i) >> continue bets
                 SM.TransitionSuccess (Ongoing bets)  -> do
                     tell (mutualBetStateOut $ Ongoing bets)
                     logInfo (BetSubmitted bets) >> continue bets
+                SM.TransitionSuccess (BettingClosed bets)  -> logInfo (MutualBetBettingClosed bets) >> continue bets
+                SM.TransitionSuccess (Finished bets) -> logError (MutualBetGameEnded bets) >> stop
+        UndoBet betParams -> do
+            logInfo @Haskell.String "Cancelling bet"
+            self <- ownPubKeyHash
+            let betAda = Ada.lovelaceOf $ nbpAmount betParams
+                cancelBet = CancelBet{ cancelBet = Bet{ betAmount = betAda, betBettor = self, betTeamId = nbpWinnerId betParams, betWinShare = Ada.lovelaceOf 0}}
+            r <- SM.runStep client cancelBet
+            logInfo @Haskell.String "SM: runStep done"
+            case r of
+                SM.TransitionFailure i -> logError (TransitionFailed i) >> continue bets
+                SM.TransitionSuccess (Ongoing bets)  -> do
+                    tell (mutualBetStateOut $ Ongoing bets)
+                    logInfo (BetCancelled bets) >> continue bets
                 SM.TransitionSuccess (BettingClosed bets)  -> logInfo (MutualBetBettingClosed bets) >> continue bets
                 SM.TransitionSuccess (Finished bets) -> logError (MutualBetGameEnded bets) >> stop
         OtherBet s -> do

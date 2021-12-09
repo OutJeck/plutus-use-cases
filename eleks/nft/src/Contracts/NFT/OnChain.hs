@@ -51,7 +51,6 @@ import           PlutusTx.Prelude                 hiding (Semigroup (..), unless
 import           Prelude                          (Semigroup (..))
 import qualified Prelude
 import           Text.Printf                      (printf)
-import           Wallet.Emulator                  (walletPubKey)
 
 {-# INLINABLE findOwnInput' #-}
 findOwnInput' :: ScriptContext -> TxInInfo
@@ -99,9 +98,10 @@ validateSell ::
     -> Bool
 validateSell NFTMarket{..} nftMeta@NFTMetadata{nftMetaTokenSymbol, nftMetaTokenName, nftTokenSymbol, nftTokenName} ctx =
     traceIfFalse "owner should sign" ownerSigned                                                                    &&
-    traceIfFalse "nft metadata token missing from input" (isNftToken inVal nftMetaTokenSymbol nftMetaTokenName)           &&
+    traceIfFalse "nft metadata token missing from input" (isNftToken inVal nftMetaTokenSymbol nftMetaTokenName)     &&
     traceIfFalse "ouptut nftMetadata should be same" (nftMeta == outDatum)                                          &&
-    traceIfFalse "price should be greater than 0" (nftSellPrice outDatum > 0)                                    
+    traceIfFalse "price should be greater than 0" (nftSellPrice outDatum > 0)                                       &&
+    traceIfFalse "price should be greater than fee" (nftSellPrice outDatum > marketFee)
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
@@ -185,7 +185,7 @@ validateBuy NFTMarket{..} nftMeta@NFTMetadata{nftMetaTokenSymbol, nftMetaTokenNa
     traceIfFalse "nft metadata token missing from input" $ isNftToken inVal nftMetaTokenSymbol nftMetaTokenName                                 &&
     traceIfFalse "ouptut nftMetadata should be same" (nftMeta == outDatum)                                                                      &&
     traceIfFalse "expected seller to get money" (addressGetValue (nftSeller nftMeta) $ Ada.lovelaceValueOf (nftSellPrice nftMeta - marketFee))  &&   
-    traceIfFalse "expected buyer to get NFT token" (addressGetValue (Just buyer) $ getNftValue nftTokenSymbol nftTokenName)                     && 
+    traceIfFalse "expected buyer to get NFT token" (addressHasValue (Just buyer) (assetClass nftTokenSymbol nftTokenName) 1)                     && 
     traceIfFalse "expected market owner to get fee" (addressGetValue (Just marketOwner) $ Ada.lovelaceValueOf marketFee)                        && 
     traceIfFalse "price should be grater 0" (nftSellPrice outDatum == 0)                                                                        && 
     traceIfFalse "fee should be grater 0" (marketFee > 0)                                                                                       && 
@@ -220,6 +220,16 @@ validateBuy NFTMarket{..} nftMeta@NFTMetadata{nftMetaTokenSymbol, nftMetaTokenNa
         [o] = [ o'
               | o' <- txInfoOutputs info
               , txOutValue o' == v
+              ]
+        in
+        fromMaybe False ((==) <$> Validation.pubKeyOutput o <*> h )
+
+    addressHasValue :: Maybe PubKeyHash -> AssetClass -> Integer -> Bool
+    addressHasValue h assetClass tokenCount =
+        let
+        [o] = [ o'
+              | o' <- txInfoOutputs info
+              , assetClassValueOf (txOutValue o') assetClass == tokenCount
               ]
         in
         fromMaybe False ((==) <$> Validation.pubKeyOutput o <*> h )

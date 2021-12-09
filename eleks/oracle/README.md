@@ -45,6 +45,12 @@ When game cancelled or completed with no winning bet all bets are returned to th
 1. Have the avility to start mutual bet contract via rest api. https://github.com/input-output-hk/plutus/issues/3972
 2. Have the ability to query complete contracts to get all users previous bets. https://github.com/input-output-hk/plutus/issues/3971
 
+## Setting up
+Follow next steps to get an environment with the correct tools set up.
+
+  - Run `nix-shell` command in the plutus folder
+  - Run `cabal build all` from the nix-shell terminal
+
 ## Games info rest server 
 
 1. Build the game rest server:
@@ -73,14 +79,28 @@ CANC - "Match Cancelled"
 
 switch to live 
 curl -v -X PUT -H "Content-Type: application/json" \
-    -d '{"ugpSatus": "LIVE", "ugpWinnerTeamId": 0}' \
+    -d '{"ugpSatus": "LIVE"}' \
     http://localhost:8081/games/1
 
 finish with winner
 curl -v -X PUT -H "Content-Type: application/json" \
-    -d '{"ugpSatus": "FT", "ugpWinnerTeamId": 55}' \
+    -d '{"ugpSatus": "FT"}' \
     http://localhost:8081/games/1
 
+4. Add Game score
+curl -v -X PUT -H "Content-Type: application/json" \
+    -d '{"ugpTeam": 55}' \
+    http://localhost:8081/games/1/score
+## Oracle rest server 
+
+1. Build the game rest server:
+```
+cabal build oraclegameserver
+```
+2. Run the Games server:
+```
+cabal exec -- oraclegameserver
+```
 ## Mutual bet rest server 
 
 1. Build the game rest server:
@@ -108,12 +128,12 @@ have `jq` installed.
 
 1. Build the PAB executable:
 ```
-cabal build bet-pab
+cabal build pab-simulator
 ```
 
 2. Run the PAB binary:
 ```
-cabal exec -- bet-pab
+cabal exec -- pab-simulator
 ```
 
 ### Pab Queries
@@ -137,9 +157,43 @@ curl -H "Content-Type: application/json" \
   --data '{"nbpAmount":3000000, "nbpWinnerId": 55}' \
   http://localhost:9080/api/contract/instance/$INSTANCE_ID/endpoint/bet
 
+2. Cancel a bet ( Only when game no started)
+curl -H "Content-Type: application/json" \
+  --request POST \
+  --data '{"nbpAmount":3000000, "nbpWinnerId": 55}' \
+  http://localhost:9080/api/contract/instance/$INSTANCE_ID/endpoint/cancelBet
 2. Get contract state
 curl -H "Content-Type: application/json" \
   --request GET \
   http://localhost:9080/api/contract/instance/$INSTANCE_ID/status | jq '.cicCurrentState.observableState'
 
-  76d5e1291d51f16eb442267faccd0ab51a3b0c4a21eb6b8f72d5f0a4ca467189ac5f70a018c6df3f632b48fd8ead1b68f39a44de06f5a5de42a6a131af0f085d44becd56fa30041efea5ff2637205181837dffd03545d3db1c11e6dcbbd3415ce8f85aad41776b99eb62a797b8c5abbe82061e1634efc4c7d5ac6fff3ca94d7f
+## Testnet
+1. Start pab
+  If it's the first time your running, you'll need to ask the PAB to make the
+  database:
+  ```
+  cabal exec -- testnet-oracle-pab --config pab-testnet/config.yml migrate
+  ```
+
+  Then, run the PAB
+
+  ```
+  cabal exec -- testnet-oracle-pab \
+    --config pab-testnet/config.yml webserver \
+    --passphrase pab123456789
+  ```
+2. Get wallet id 
+  ```
+  curl -H "content-type: application/json" -XGET \
+    localhost:8090/v2/wallets
+  ```
+  export it - export WALLET_ID=88cc0e42b4a4f29d192c8b05967c386cb4c2aeaa
+
+  
+3. Activate oracle
+
+  ```
+ curl -H "Content-Type: application/json" -v -X POST -d \
+    "{\"caID\":{\"tag\":\"OracleContract\", \"contents\": {\"opFees1\":{\"getLovelace\":1500000},\"opPublicKey1\":{\"getPubKey\":\"a2709b7f683084f5f3dcb9197afbc8528282449a38bdc3b240894e7a63823b81\"},\"opCollateral1\":{\"getLovelace\":1000000}}},\"caWallet\":{\"getWalletId\":\"$WALLET_ID\"}}" \
+    localhost:9080/api/contract/activate
+  ```

@@ -26,7 +26,7 @@ import           Contracts.Oracle.Types
 import           Data.Monoid                      (Last (..))
 import           Data.Semigroup.Generic           (GenericSemigroupMonoid (..))
 import           Ledger
-import           Ledger.Oracle
+import           Plutus.Contract.Oracle 
 import           Ledger.Value     
 import           Playground.Contract              (Show, FromJSON, Generic, ToJSON, ToSchema)
 import qualified Plutus.Contract.StateMachine     as SM
@@ -47,21 +47,28 @@ data MutualBetParams
         , mbpMinBet :: Ada -- Minimum bet allowed
         , mbpBetFee :: Ada -- Platform fee, for each bet you need additionally to pay the fee, fee is no returned if game in case game cancelled or no one wins
         }
-        deriving stock (Haskell.Eq, Haskell.Show, Generic)
+        deriving stock (Haskell.Eq, Haskell.Ord, Haskell.Show, Generic)
         deriving anyclass (ToJSON, FromJSON, ToSchema, OpenApi.ToSchema)
 
 PlutusTx.makeLift ''MutualBetParams
 
 data Bet =
     Bet
-        { betAmount  :: Ada
-        , betBettor  :: PubKeyHash
-        , betTeamId  :: Integer
+        { betAmount   :: Ada
+        , betBettor   :: PubKeyHash
+        , betTeamId   :: Integer
+        , betWinShare :: Ada
         }
     deriving stock (Haskell.Eq, Haskell.Show, Generic)
     deriving anyclass (ToJSON, FromJSON)
 
 PlutusTx.unstableMakeIsData ''Bet
+
+instance Eq Bet where
+    {-# INLINABLE (==) #-}
+    l == r = (betAmount l == betAmount r) && 
+             (betBettor l == betBettor r) &&
+             (betTeamId l == betTeamId r)
 
 -- | The states of the auction
 data MutualBetState
@@ -97,7 +104,8 @@ PlutusTx.unstableMakeIsData ''MutualBetState
 
 -- | Transition between auction states
 data MutualBetInput
-    = NewBet { newBetAmount :: Ada, newBettor :: PubKeyHash, newBetTeamId :: Integer } -- Increase the price
+    = NewBet { newBet :: Bet } -- Increase the price
+    | CancelBet { cancelBet :: Bet }
     | FinishBetting { oracleSigned :: SignedMessage OracleSignedMessage }
     | Payout { oracleValue :: OracleData, oracleRef :: TxOutRef, oracleSigned :: SignedMessage OracleSignedMessage }
     | CancelGame
@@ -120,6 +128,7 @@ data MutualBetLog =
     MutualBetStarted MutualBetParams -- Contract started
     | MutualBetFailed SM.SMContractError -- Contract start erro
     | BetSubmitted [Bet] -- bet submitted
+    | BetCancelled [Bet]
     | MutualBetBettingClosed [Bet] -- Betting not allowed
     | MutualBetCancelled [Bet] -- Game cancelled
     | MutualBetGameEnded [Bet] -- Game completed

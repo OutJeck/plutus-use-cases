@@ -20,6 +20,7 @@ module Contracts.MutualBet.StateMachine(
     typedValidator
     , mutualBetStateMachine
     , MutualBetMachine
+    , includeWinshareInBets
     ) where
 
 import           Contracts.Oracle
@@ -39,7 +40,7 @@ import qualified Ledger.Ada                       as Ada
 import qualified Ledger.Constraints               as Constraints
 import           Ledger.Constraints.TxConstraints (TxConstraints)
 import qualified Ledger.Interval                  as Interval
-import qualified Ledger.Oracle                    as Oracle
+import qualified Plutus.Contract.Oracle           as Oracle
 import qualified Ledger.Value                     as Value
 import           Ledger.TimeSlot                  (SlotConfig)
 import qualified Ledger.TimeSlot                  as TimeSlot
@@ -75,51 +76,81 @@ calculatePrize bet totalBets totalWin =
         totalPrize = totalBets - totalWin
         amount = betAmount bet
     in
-        bool ((Ada.divide amount totalWin) * totalPrize) 0 (totalWin == 0)
+        bool ((Ada.divide (amount * totalPrize ) totalWin)) 0 (totalWin == 0)
         
 {-# INLINABLE calculateWinnerShare #-}
 calculateWinnerShare :: Bet -> Ada -> Ada -> Ada
-calculateWinnerShare bet totalBets totalWin = 
-    (betAmount bet) + calculatePrize bet totalBets totalWin
-
+calculateWinnerShare bet totalBets totalWin = calculatePrize bet totalBets totalWin
+   
 {-# INLINABLE getWinners #-}
-getWinners :: Integer -> [Bet] -> [(PubKeyHash, Ada)]
+getWinners :: Integer -> [Bet] -> [(PubKeyHash, Ada, Ada)]
 getWinners winnerTeamId bets = 
     let 
         winnerBets = winBets winnerTeamId bets
         total = betsValueAmount bets
         totalWin = betsValueAmount $ winnerBets
     in 
-        map (\winBet -> (betBettor winBet, calculateWinnerShare winBet total totalWin)) winnerBets
+        map (\winBet -> (betBettor winBet, betAmount winBet, calculateWinnerShare winBet total totalWin)) winnerBets
+
+{-# INLINABLE includeWinshareInBets #-}
+includeWinshareInBets  :: Integer -> [Bet] -> [Bet]
+includeWinshareInBets winnerTeamId bets =
+    let 
+        winnerBets = winBets winnerTeamId bets
+        total = betsValueAmount bets
+        totalWin = betsValueAmount $ winnerBets
+    in 
+    map (\bet -> bet{
+        betWinShare = if betTeamId bet == winnerTeamId 
+            then calculateWinnerShare bet total totalWin
+            else Ada.lovelaceOf 0
+        }) bets
 
 {-# INLINABLE mkTxPayWinners #-}
-mkTxPayWinners :: [(PubKeyHash, Ada)]-> TxConstraints Void Void
-mkTxPayWinners = foldMap (\(winnerAddressHash, winnerPrize) -> Constraints.mustPayToPubKey winnerAddressHash $ Ada.toValue winnerPrize)
+mkTxPayWinners :: [(PubKeyHash, Ada, Ada)]-> TxConstraints Void Void
+mkTxPayWinners = foldMap (\(winnerAddressHash, winnerBetAmount, winnerPrize) -> Constraints.mustPayToPubKey winnerAddressHash $ Ada.toValue $ winnerBetAmount + winnerPrize)
 
 {-# INLINABLE mkTxReturnBets #-}
 mkTxReturnBets :: [Bet] -> TxConstraints Void Void
 mkTxReturnBets = foldMap (\bet -> Constraints.mustPayToPubKey (betBettor bet) $ Ada.toValue (betAmount bet))
 
 {-# INLINABLE isValidBet #-}
-isValidBet ::  MutualBetParams -> MutualBetInput -> Bool 
-isValidBet MutualBetParams{mbpTeam1, mbpTeam2, mbpMinBet} NewBet{newBetAmount, newBetTeamId}
-    | newBetAmount < mbpMinBet = False
-    | mbpTeam1 /= newBetTeamId && mbpTeam2 /= newBetTeamId = False
+isValidBet ::  MutualBetParams -> Bet -> Bool 
+isValidBet MutualBetParams{mbpTeam1, mbpTeam2, mbpMinBet} Bet{betAmount, betTeamId, betWinShare}
+    | betAmount < mbpMinBet = False
+    | mbpTeam1 /= betTeamId && mbpTeam2 /= betTeamId = False
+    | betWinShare /= 0 = False
     | otherwise = True
+
+{-# INLINABLE deleteFirstOccurence #-}
+deleteFirstOccurence :: Bet -> [Bet] -> [Bet]
+deleteFirstOccurence bet (x:xs)
+    | (bet==x) = xs
+    | otherwise = x : deleteFirstOccurence bet xs
 
 {-# INLINABLE mutualBetTransition #-}
 -- | The transitions of the mutual bet state machine.
 mutualBetTransition :: MutualBetParams -> State MutualBetState -> MutualBetInput -> Maybe (TxConstraints Void Void, State MutualBetState)
-mutualBetTransition params@MutualBetParams{mbpOracle, mbpOwner, mbpBetFee} State{stateData=oldState} input =
-    case (oldState, input) of
-        (Ongoing bets, newBet@NewBet{newBetAmount, newBettor, newBetTeamId}) 
+mutualBetTransition params@MutualBetParams{mbpOracle, mbpOwner, mbpBetFee} State{stateData=oldStateData, stateValue=oldStateValue} input =
+    case (oldStateData, input) of
+        (Ongoing bets, NewBet{newBet}) 
             | isValidBet params newBet ->
                 let constraints = Constraints.mustPayToPubKey mbpOwner $ Ada.toValue mbpBetFee
-                    newBets = Bet{betAmount = newBetAmount, betBettor = newBettor, betTeamId = newBetTeamId}:bets
+                    newBets = newBet:bets
                     newState =
                         State
                             { stateData = Ongoing newBets
-                            , stateValue = Ada.toValue $ betsValueAmount newBets
+                            , stateValue = oldStateValue <> (Ada.toValue $ betAmount newBet)
+                            }
+                in Just (constraints, newState)
+        (Ongoing bets, CancelBet{cancelBet}) 
+            | elem cancelBet bets ->
+                let constraints = Constraints.mustPayToPubKey (betBettor cancelBet) $ Ada.toValue (betAmount cancelBet)
+                    newBets = deleteFirstOccurence cancelBet bets 
+                    newState =
+                        State
+                            { stateData = Ongoing newBets
+                            , stateValue = oldStateValue <> inv (Ada.toValue $ betAmount cancelBet)
                             }
                 in Just (constraints, newState)
         (Ongoing bets, FinishBetting{oracleSigned})
@@ -128,7 +159,7 @@ mutualBetTransition params@MutualBetParams{mbpOracle, mbpOwner, mbpBetFee} State
                     newState =
                         State
                             { stateData = BettingClosed bets
-                            , stateValue = Ada.toValue $ betsValueAmount bets
+                            , stateValue = oldStateValue
                             }
                 in Just (constraints, newState)
         (Ongoing bets, CancelGame) ->
@@ -144,6 +175,8 @@ mutualBetTransition params@MutualBetParams{mbpOracle, mbpOwner, mbpBetFee} State
                         else mkTxPayWinners winners 
                     constraints = payConstraints
                                 <> oracleSignConstraints
+                    
+                    
                     newState = State { stateData = Finished bets, stateValue = mempty }
                 in Just (constraints, newState)
         _ -> Nothing
